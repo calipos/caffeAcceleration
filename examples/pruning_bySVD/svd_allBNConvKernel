@@ -1,0 +1,252 @@
+#coding=utf-8
+
+import os.path as osp
+import sys
+import copy
+import os
+import numpy as np
+import numpy.linalg as linalg
+
+energyThreshold=0.80
+
+CAFFE_ROOT = '/home/lbl/lbl_trainData/git/caffe_pruning'
+if osp.join(CAFFE_ROOT,'python') not in sys.path:
+        sys.path.insert(0,osp.join(CAFFE_ROOT,'python'))
+
+import caffe
+
+def isConvBn(lines,start1,end1,start2,end2,start3,end3):
+	check1=False
+	check2=False
+	check3=False
+	check4=False
+	
+	for i in range(start1,end1):
+		if check1==False and lines[i].find("\"Convolution\"")>=0 : check1=True
+		if check2==False and lines[i].find("bias_term")>=0 and lines[i].find("false")>=0 : check2=True
+	for i in range(start2,end2):
+		if check3==False and lines[i].find("\"BatchNorm\"")>=0 : check3=True
+	for i in range(start3,end3):
+		if check4==False and lines[i].find("\"Scale\"")>=0 : check4=True
+	if check1==True and check2==True and check3==True and check4==True :return True
+	else:return False
+def getLayerName(lines,start1,end1):
+	for i in range(start1,end1):
+		if lines[i].find("name")>=0 : return lines[i].split()[1].split('\"')[1]
+def getTheConv(file):
+	lines=[]
+	originLines=[]
+	layersScope=[]
+	theConvName=[]
+	allName=[]
+	with open(file) as f:
+		for line in f:
+			originLines.append(line)
+			lines.append(line.strip())
+	for i in range(len(lines)):
+		if lines[i].find("layer {")>=0:
+			layersScope.append([i,len(lines)-1])
+			if len(layersScope)>1:layersScope[len(layersScope)-2][1]=i-1
+	for i in range(len(layersScope)):
+		if i<len(layersScope)-3:
+			startLineIdx1=layersScope[i][0]
+			endLineIdx1=layersScope[i][1]
+			startLineIdx2=layersScope[i+1][0]
+			endLineIdx2=layersScope[i+1][1]
+			startLineIdx3=layersScope[i+2][0]
+			endLineIdx3=layersScope[i+2][1]
+			if isConvBn(lines,startLineIdx1,endLineIdx1,startLineIdx2,endLineIdx2,startLineIdx3,endLineIdx3)==True :
+				theConvName.append(getLayerName(lines,layersScope[i][0],layersScope[i][1]))
+				allName.append(getLayerName(lines,layersScope[i][0],layersScope[i][1]))
+			else: allName.append("-");
+		else : allName.append("-")
+	return allName,theConvName,lines,layersScope,originLines
+def getPadStrideKernelandNames(lines,start1,end1):
+	bottomNameCnt=0
+	topNameCnt=0
+	bottomName=""
+	topName=""
+	stride='1'
+	kernel='3'
+	pad='0'
+	output='0'
+	for i in range(start1,end1):
+		if lines[i].find("bottom")>=0 : 
+			bottomName=lines[i].split()[1].split('\"')[1]
+			bottomNameCnt+=1
+		if lines[i].find("top")>=0 : 
+			topName=lines[i].split()[1].split('\"')[1]
+			topNameCnt+=1
+		if lines[i].find("num_output")>=0 : 
+			output=lines[i].split()[1]
+		if lines[i].find("stride")>=0 : 
+			stride=lines[i].split()[1]
+		if lines[i].find("kernel_size")>=0 : 
+			kernel=lines[i].split()[1]
+		if lines[i].find("pad")>=0 : 
+			pad=lines[i].split()[1]
+	assert bottomNameCnt==1
+	assert topNameCnt==1
+	assert int(output)>0
+	
+	return bottomName,topName,output,kernel,pad,stride
+def writeSplitLayers(f,layerName,bottomName,topName,kernel,pad,stride,mid_out,out):
+	f.write("layer {\n")
+	f.write("  name: \""+layerName+"_mid\"\n")
+	f.write("  type: \"Convolution\"\n")
+	f.write("  bottom: \""+bottomName+"\"\n")
+	f.write("  top: \""+topName+"_mid\"\n")
+	
+	f.write("  param {\n")
+	f.write("    lr_mult: 0.0\n")
+	f.write("    decay_mult: 0.0\n")
+	f.write("  }\n")
+	
+	f.write("  convolution_param {\n")
+	f.write("    num_output: "+str(mid_out)+"\n")
+	f.write("    bias_term: false\n")
+	f.write("    pad_h: "+str(pad)+"\n")
+	f.write("    pad_w: 0\n")
+	f.write("    kernel_h: "+str(kernel)+"\n")
+	f.write("    kernel_w: 1\n")
+	f.write("    stride_h: "+str(stride)+"\n")
+	f.write("    stride_w: 1\n")
+	
+	f.write("    weight_filler {\n")
+	f.write("      type: \"xavier\"\n")
+	f.write("    }\n")
+	f.write("    bias_filler {\n")
+	f.write("      type: \"constant\"\n")
+	f.write("    }\n")
+	f.write("  }\n")
+	f.write("}\n")
+	
+	f.write("layer {\n")
+	f.write("  name: \""+layerName+"_mid2\"\n")
+	f.write("  type: \"Convolution\"\n")
+	f.write("  bottom: \""+topName+"_mid\"\n")
+	f.write("  top: \""+topName+"\"\n")
+	
+	f.write("  convolution_param {\n")
+	f.write("    num_output: "+str(out)+"\n")
+	f.write("    bias_term: false\n")
+	f.write("    pad_w: "+str(pad)+"\n")
+	f.write("    pad_h: 0\n")
+	f.write("    kernel_w: "+str(kernel)+"\n")
+	f.write("    kernel_h: 1\n")
+	f.write("    stride_w: "+str(stride)+"\n")
+	f.write("    stride_h: 1\n")
+	
+	f.write("    weight_filler {\n")
+	f.write("      type: \"xavier\"\n")
+	f.write("    }\n")
+	f.write("    bias_filler {\n")
+	f.write("      type: \"constant\"\n")
+	f.write("    }\n")
+	f.write("  }\n")
+	f.write("}\n")
+	print ('  name: '+layerName+"_mid\n"),('  name: '+layerName+"_mid2\n")
+def writeOldLayer(f,lines,start1,end1):
+	for i in range(start1,end1+1):
+		f.write(lines[i])
+	
+	
+caffe.set_mode_gpu()
+original_net = caffe.Net('./bn.prototxt', './pelee_bn.caffemodel', caffe.TEST)
+#original_net = caffe.Net('./models/result.prototxt', './models/result.caffemodel', caffe.TEST)
+
+
+allNames,convLayers,lines,convsScope,originLines=getTheConv('./bn.prototxt')
+
+print len(allNames)
+print len(convsScope)
+#print convsScope
+
+f=open("split.prototxt",'w')
+for i in range(convsScope[0][0]):
+	f.write(lines[i])
+	f.write('\n')
+for idx,layerNames in enumerate(allNames):
+	if layerNames not in convLayers:
+		writeOldLayer(f,originLines,convsScope[idx][0],convsScope[idx][1])
+		continue
+	convName = layerNames
+	theLayer = original_net._layer_by_name(convName)
+	weights=theLayer.blobs[0].data
+	dim=weights.shape
+	if dim[2]==1 or dim[3]!=dim[2]:
+		writeOldLayer(f,originLines,convsScope[idx][0],convsScope[idx][1])
+		continue
+	weights=np.transpose(weights,[1,2,0,3])
+	weights=weights.reshape(dim[1]*dim[2],dim[0]*dim[3])
+	V,sig,H = linalg.svd(weights)
+	acc=[sig[0]]
+	for i in range(1,len(sig)):
+		acc.append((sig[i]+acc[i-1]))
+	acc= acc/np.sum(sig)
+	#print acc
+	for i in range(len(sig)):
+		if acc[i]>energyThreshold:
+			rank=i+1
+			break
+	print convName,rank,"origin_out = ",dim[1]*dim[2]
+	#print idx,convName,convsScope[idx][0],convsScope[idx][1]
+	bottomName,topName,output,kernel,pad,stride=getPadStrideKernelandNames(lines,convsScope[idx][0],convsScope[idx][1])
+	#print bottomName,topName,output,kernel,pad,stride
+	writeSplitLayers(f,convName,bottomName,topName,kernel,pad,stride,rank,output)
+f.close()
+
+					
+
+split_net = caffe.Net('./split.prototxt', './pelee_bn.caffemodel', caffe.TEST)
+
+for idx,layerNames in enumerate(allNames):
+	if layerNames not in convLayers:
+		continue
+	#print layerNames
+	convName = layerNames
+	theLayer = original_net._layer_by_name(convName)
+	weights=theLayer.blobs[0].data
+	dim=weights.shape
+	if dim[2]==1 or dim[3]!=dim[2]:
+		continue
+	weights=np.transpose(weights,[1,2,0,3])
+	weights=weights.reshape(dim[1]*dim[2],dim[0]*dim[3])
+	V,sig,H = linalg.svd(weights)
+	acc=[sig[0]]
+	for i in range(1,len(sig)):
+		acc.append((sig[i]+acc[i-1]))
+	acc= acc/np.sum(sig)
+	#print acc
+	for i in range(len(sig)):
+		if acc[i]>energyThreshold:
+			rank=i+1
+			break
+	V=V[:,0:rank]
+	H=H[0:rank,:]
+	sig=np.diag(sig[0:rank])
+	H=sig.dot(H)
+
+	H=H.reshape(rank,dim[0],dim[3],1)
+	V=V.reshape(dim[1],1,dim[2],rank)
+	H = np.transpose(H, [1, 0, 3, 2])
+	V = np.transpose(V, [3, 0, 2, 1])
+	
+	
+	theLayer = split_net._layer_by_name(convName+"_mid")
+	dim11=theLayer.blobs[0].data.shape
+	for n in range(dim11[0]):
+		for c in range(dim11[1]):
+			for h in range(dim11[2]):
+				for w in range(dim11[3]):
+					split_net._layer_by_name(convName+"_mid").blobs[0].data[n,c,h,w]=V[n,c,h,w]
+	theLayer = split_net._layer_by_name(convName+"_mid2")
+	dim12=theLayer.blobs[0].data.shape
+	for n in range(dim12[0]):
+		for c in range(dim12[1]):
+			for h in range(dim12[2]):
+				for w in range(dim12[3]):
+					split_net._layer_by_name(convName+"_mid2").blobs[0].data[n,c,h,w]=H[n,c,h,w]
+					
+split_net.save("split.caffemodel")
+exit(0)
